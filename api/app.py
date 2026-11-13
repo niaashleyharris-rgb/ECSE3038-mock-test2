@@ -1,83 +1,121 @@
 import os
+import time
+import secrets
 from typing import Optional
-from fastapi import FastAPI, Header, HTTPException, status
-from pydantic import BaseModel
+from fastapi import FastAPI, Header, HTTPException, Response, status
+from pydantic import BaseModel, Field
 from pymongo import MongoClient
 from dotenv import load_dotenv
+import paho.mqtt.client as mqtt
 
-# 1. Load Environment Variables from .env
 load_dotenv()
 
-MONGO_URL = os.getenv("MONGO_URL")
-EXPECTED_API_KEY = os.getenv("API_KEY")
+MONGODB_URI = os.getenv("MONGODB_URI") 
+MQTT_NAME = os.getenv("MQTT_NAME", "student")
 
-if not MONGO_URL:
-    raise RuntimeError("MONGO_URL is missing from your .env file!")
-if not EXPECTED_API_KEY:
-    raise RuntimeError("API_KEY is missing from your .env file!")
+if not MONGODB_URI:
+    raise RuntimeError("MONGODB_URI is missing from .env")
 
-# 2. Connect to MongoDB Atlas
-client = MongoClient(MONGO_URL)
+client = MongoClient(MONGODB_URI)
 db = client["cold_room_db"]
+devices_col = db["devices"]
 readings_col = db["readings"]
+alarms_col = db["alarms"]
 
-app = FastAPI(title="Cold-Room Monitor API (Mock Test 2)")
+app = FastAPI(title="Cold-Room Monitor API")
 
-# 3. Pydantic Models for Automatic Data Validation (Returns 422 on bad data)
-class SensorReading(BaseModel):
-    device_id: str
-    temperature: float
-    humidity: float
-    timestamp: float
+# Connect to Class MQTT Broker (Slide 3)
+MQTT_BROKER = "135.232.203.144"
+mqtt_client = mqtt.Client()
+try:
+    mqtt_client.connect(MQTT_BROKER, 1883, 60)
+    mqtt_client.loop_start()
+except Exception as e:
+    print(f"MQTT connection warning: {e}")
 
-class AlarmLimit(BaseModel):
-    threshold: float
+# --- Pydantic Models ---
+class DeviceCreate(BaseModel):
+    mac: str
+    room: str
 
-# 4. Helper Function: Verify Custom API Key Header
-def verify_api_key(x_api_key: Optional[str] = Header(None)):
-    if not x_api_key:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="API Key header missing (X-API-Key required)"
-        )
-    if x_api_key != EXPECTED_API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid API Key provided"
-        )
-    return x_api_key
+class ReadingCreate(BaseModel):
+    mac: str
+    temp: float = Field(ge=-40, le=80)  # Slide 7: 422 if outside DHT22 range
 
-# --- Endpoints ---
+class AlarmUpdate(BaseModel):
+    max_temp: float
 
-@app.get("/")
-def root():
-    return {"status": "Cold-Room Monitor API is online"}
+# --- Routes ---
 
-# POST /readings: Save new sensor data to MongoDB
+# A1: Register device & return generated key
+@app.post("/devices", status_code=status.HTTP_201_CREATED)
+def create_device(device: DeviceCreate):
+    if devices_col.find_one({"mac": device.mac}):
+        raise HTTPException(status_code=409, detail="MAC already registered")
+    
+    key = secrets.token_urlsafe(16)
+    devices_col.insert_one({
+        "mac": device.mac,
+        "room": device.room,
+        "api_key": key
+    })
+    return {"mac": device.mac, "room": device.room, "api_key": key}
+
+# Slide 6: GET /devices must NEVER show the keys
+@app.get("/devices")
+def get_devices():
+    return list(devices_col.find({}, {"_id": 0, "api_key": 0}))
+
+# A2: Ingest reading with strict 401 / 403 / 422 checks
 @app.post("/readings", status_code=status.HTTP_201_CREATED)
-def create_reading(reading: SensorReading, x_api_key: Optional[str] = Header(None)):
-    verify_api_key(x_api_key)
+def create_reading(reading: ReadingCreate, x_api_key: str | None = Header(default=None)):
+    if not x_api_key:
+        raise HTTPException(status_code=401, detail="Missing X-API-Key header")
     
-    doc = reading.dict()
+    device = devices_col.find_one({"api_key": x_api_key})
+    if not device:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    if device["mac"] != reading.mac:
+        raise HTTPException(status_code=403, detail="API key belongs to another MAC")
+    
+    doc = {
+        "mac": reading.mac,
+        "temp": reading.temp,
+        "timestamp": time.time()
+    }
     readings_col.insert_one(doc)
-    doc.pop("_id", None)  # Remove BSON ObjectId before returning JSON
-    return {"message": "Reading recorded successfully", "data": doc}
+    doc.pop("_id", None)
+    return doc
 
-# GET /readings: Retrieve sensor data (supports ?since= timestamp query)
+# A3: Retrieve readings newest first, with ?mac= and ?since= filters
 @app.get("/readings")
-def get_readings(since: Optional[float] = None, x_api_key: Optional[str] = Header(None)):
-    verify_api_key(x_api_key)
-    
+def get_readings(mac: Optional[str] = None, since: Optional[float] = None):
     query = {}
+    if mac:
+        query["mac"] = mac
     if since is not None:
         query["timestamp"] = {"$gte": since}
         
-    readings = list(readings_col.find(query, {"_id": 0}))
-    return readings
+    return list(readings_col.find(query, {"_id": 0}).sort("timestamp", -1))
 
-# PUT /alarm: Update temperature threshold setpoint
-@app.put("/alarm")
-def update_alarm(limit: AlarmLimit, x_api_key: Optional[str] = Header(None)):
-    verify_api_key(x_api_key)
+# A4: Store alarm limit (201 new, 200 replaced) & publish retained MQTT
+@app.put("/alarm/{mac}")
+def set_alarm(mac: str, alarm: AlarmUpdate, response: Response):
+    if not devices_col.find_one({"mac": mac}):
+        raise HTTPException(status_code=404, detail="Unknown MAC address")
     
-    return {"message": "Alarm setpoint updated", "threshold": limit.threshold}
+    existing = alarms_col.find_one({"mac": mac})
+    alarms_col.update_one(
+        {"mac": mac},
+        {"$set": {"mac": mac, "max_temp": alarm.max_temp}},
+        upsert=True
+    )
+    
+    response.status_code = status.HTTP_200_OK if existing else status.HTTP_201_CREATED
+    
+    # Publish retained limit to ecse3038/<name>/alarm/max
+    topic = f"ecse3038/{MQTT_NAME}/alarm/max"
+    mqtt_client.publish(topic, str(alarm.max_temp), retain=True)
+    
+    return {"mac": mac, "max_temp": alarm.max_temp}
